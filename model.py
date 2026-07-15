@@ -99,7 +99,8 @@ class FMS(nn.Module):
 # ==========================================
 class ResidualBlock(nn.Module):
     """
-    Standard 1D residual connection combined with a post-processing FMS block.
+    Standard 1D residual connection combined with a post-processing FMS block
+    and an architectural MaxPool1d layer for temporal downsampling.
     """
     def __init__(self, in_channels, out_channels):
         super(ResidualBlock, self).__init__()
@@ -111,6 +112,9 @@ class ResidualBlock(nn.Module):
         self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
         
         self.fms = FMS(out_channels)
+        
+        # Max pooling downsampling layer added to every block
+        self.mp = nn.MaxPool1d(kernel_size=3)
         
         # Shortcut connection handling dimension mismatches
         self.shortcut = nn.Sequential()
@@ -131,7 +135,12 @@ class ResidualBlock(nn.Module):
         out = self.conv2(out)
         
         out = self.fms(out)
-        return out + residual
+        
+        # Element-wise addition occurs BEFORE the max pooling operation
+        out = out + residual
+        out = self.mp(out)
+        
+        return out
 
 
 # ==========================================
@@ -174,17 +183,15 @@ class RawNet2(nn.Module):
         if len(x.shape) == 2:
             x = x.unsqueeze(1)
             
-        # Frontend features
+        # Frontend features (Runs on GPU via DirectML)
         x = self.sinc_conv(x)
         x = self.first_bn(x)
         x = self.leaky_relu(x)
         x = self.max_pool(x)
         
-        # Residual extraction blocks
+        # Residual extraction blocks (Runs on GPU via DirectML)
         x = self.block1(x)
         x = self.block2(x)
-        x = self.max_pool(x)
-        
         x = self.block3(x)
         x = self.block4(x)
         x = self.block5(x)
@@ -196,11 +203,27 @@ class RawNet2(nn.Module):
         # Prepare for sequence processing: transpose (batch, channels, timesteps) -> (batch, timesteps, channels)
         x = x.transpose(1, 2)
         
-        # GRU returns (out, h_n) where h_n contains final hidden state
+        # =====================================================================
+        # DYNAMIC DEVICE BRIDGE WORKAROUND FOR DIRECTML RNN FALLBACK BUG
+        # =====================================================================
+        # 1. Determine where the GRU parameters are located (could be GPU or CPU)
+        gru_device = next(self.gru.parameters()).device
+        
+        # 2. If the current tensor is on the GPU but the GRU is on the CPU, copy it over
+        if x.device != gru_device:
+            x = x.to(gru_device)
+            
+        # GRU returns (out, h_n) where h_n contains final hidden state (Runs on CPU)
         _, h_n = self.gru(x)
         
         # We take the output of the final GRU layer 
         feat = h_n[-1] # shape: (batch, 1024)
+        
+        # 3. Safely copy the feature tensor back to match the FC classifier's device (GPU)
+        fc_device = self.fc_classifier.weight.device
+        if feat.device != fc_device:
+            feat = feat.to(fc_device)
+        # =====================================================================
         
         out = self.fc_classifier(feat)
         return out
